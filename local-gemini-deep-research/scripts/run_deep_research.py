@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 from playwright.sync_api import sync_playwright
@@ -10,6 +11,8 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
+if hasattr(sys.stdin, "reconfigure"):
+    sys.stdin.reconfigure(encoding="utf-8")
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
@@ -138,7 +141,6 @@ HTML_TO_MARKDOWN_JS = r"""
         .replace(/\n{3,}/g, '\n\n')
         .trim();
 
-    // Collect external citation links from the page/panel
     const sourceLinks = [];
     const seenUrls = new Set();
     const linkEls = Array.from(document.querySelectorAll('deep-research-immersive-panel a[href^="http"], sources-list a[href^="http"], [data-test-id*="source"] a[href^="http"], model-response a[href^="http"]'));
@@ -181,66 +183,90 @@ def prevent_background_throttling(page):
         log(f"Note: CDP focus emulation setup warning (non-fatal): {e}")
 
 
+def ensure_pro_mode(page):
+    """Ensure '3.8 Flash' model is selected so Deep Research and multi-turn plan editing are always enabled and fast."""
+    mode_btn = page.locator('[data-test-id="bard-mode-menu-button"]').first
+    if mode_btn.count() > 0:
+        current_mode = mode_btn.inner_text().strip()
+        if current_mode != "Flash":
+            mode_btn.evaluate("el => el.click()")
+            time.sleep(0.8)
+            switched = page.evaluate(
+                """() => {
+                    const item = Array.from(document.querySelectorAll('gem-menu-item, [role="menuitemradio"], [role="menuitem"]'))
+                        .find(el => el.innerText.includes('3.8 Flash') || (el.innerText.includes('Flash') && !el.innerText.includes('Lite')));
+                    if (item) {
+                        (item.querySelector('button') || item).click();
+                        return true;
+                    }
+                    return false;
+                }"""
+            )
+            if switched:
+                time.sleep(1.0)
+                log(f"Switched model mode to: {mode_btn.inner_text().strip()}")
+            else:
+                page.keyboard.press("Escape")
+
+
 def activate_deep_research_mode(page):
     page.wait_for_selector('[role="textbox"]', timeout=30000)
+    ensure_pro_mode(page)
+
     deselect_btn = page.locator(
         '[data-test-id="deselect-drawer-item-gem-button"], button[aria-label*="Deep Research 선택 해제"], button[aria-label*="Deselect Deep Research"]'
     )
-    if deselect_btn.count() > 0:
-        log("Deep Research mode is already active.")
-        return
+    dr_enabled_btn = page.locator(
+        'button:has-text("Deep Research"):not([aria-label*="선택 해제"]):not([aria-label*="Deselect"]):not([disabled]):not([aria-disabled="true"])'
+    )
+    if deselect_btn.count() == 0 or not deselect_btn.first.is_visible():
+        log("Activating Deep Research mode...")
+        tools_selector = 'button[aria-label="업로드 및 도구"], button[aria-label="Upload and tools"]'
+        page.wait_for_selector(tools_selector, timeout=20000)
+        tools_btn = page.locator(tools_selector).first
 
-    log("Activating Deep Research mode...")
-    tools_selector = 'button[aria-label="업로드 및 도구"], button[aria-label="Upload and tools"]'
-    page.wait_for_selector(tools_selector, timeout=20000)
-    tools_btn = page.locator(tools_selector).first
-
-    for attempt in range(5):
-        if deselect_btn.count() > 0:
-            log("Deep Research mode enabled successfully.")
-            return
-
-        if tools_btn.get_attribute("aria-expanded") != "true":
-            tools_btn.click()
-            time.sleep(1.0)
-
-        more_btn = page.locator('[data-test-id="more-tools-button"]').first
-        if more_btn.count() > 0 and page.locator('button:has-text("Deep Research")').count() == 0:
-            more_btn.click()
-            time.sleep(0.8)
-
-        dr_btn = page.locator('button:has-text("Deep Research")').first
-        if dr_btn.count() > 0:
-            dr_btn.click()
-            time.sleep(1.0)
-            if deselect_btn.count() > 0:
-                log("Deep Research mode enabled successfully.")
+        for _ in range(5):
+            if deselect_btn.count() > 0 and deselect_btn.first.is_visible():
                 break
 
-        time.sleep(1.0)
-    else:
-        raise RuntimeError("Could not activate 'Deep Research' mode from the Tools menu.")
+            more_btn = page.locator('[data-test-id="more-tools-button"]').first
+            dr_ready = dr_enabled_btn.count() > 0 and dr_enabled_btn.first.is_visible()
+            more_visible = more_btn.count() > 0 and more_btn.is_visible()
 
-    # Ensure 4 Argon model is selected for reliable Deep Research execution
-    mode_btn = page.locator('[data-test-id="bard-mode-menu-button"]').first
-    if mode_btn.count() > 0 and "Argon" not in mode_btn.inner_text():
-        mode_btn.click()
-        time.sleep(0.8)
-        argon_opt = page.locator('gem-menu-item:has-text("Argon")').first
-        if argon_opt.count() > 0:
-            argon_opt.click()
+            if not dr_ready and not more_visible:
+                tools_btn.evaluate("el => el.click()")
+                time.sleep(1.0)
+                more_visible = more_btn.count() > 0 and more_btn.is_visible()
+
+            if more_visible and not (dr_enabled_btn.count() > 0 and dr_enabled_btn.first.is_visible()):
+                more_btn.evaluate("el => el.click()")
+                time.sleep(1.0)
+
+            if dr_enabled_btn.count() > 0 and dr_enabled_btn.first.is_visible():
+                dr_enabled_btn.first.evaluate("el => el.click()")
+                for _ in range(6):
+                    time.sleep(0.5)
+                    if deselect_btn.count() > 0 and deselect_btn.first.is_visible():
+                        break
+                if deselect_btn.count() > 0 and deselect_btn.first.is_visible():
+                    log("Deep Research mode enabled successfully.")
+                    break
+
             time.sleep(1.0)
-            log(f"Switched model mode to: {mode_btn.inner_text().strip()}")
         else:
-            page.keyboard.press("Escape")
+            raise RuntimeError("Could not activate 'Deep Research' mode from the Tools menu.")
+    else:
+        log("Deep Research mode is already active.")
 
 
-def submit_prompt(page, prompt_text):
-    log(f"Entering prompt: {prompt_text[:80]}{'...' if len(prompt_text) > 80 else ''}")
+def submit_prompt(page, prompt_text, raw_prompt=False):
+    mode_str = "exact/raw prompt" if raw_prompt else "prompt"
+    log(f"Entering {mode_str}: {prompt_text[:80]}{'...' if len(prompt_text) > 80 else ''}")
     textbox = page.locator('[role="textbox"]').first
     textbox.click()
     page.keyboard.press("Control+A")
     page.keyboard.press("Backspace")
+    # Insert exact prompt string without any modification
     page.keyboard.insert_text(prompt_text)
     time.sleep(0.6)
 
@@ -249,16 +275,61 @@ def submit_prompt(page, prompt_text):
         send_btn.click()
     else:
         textbox.press("Enter")
-    log("Prompt submitted. Waiting for Research Plan generation...")
+    log("Prompt submitted.")
 
 
-def wait_for_and_confirm_plan(page, plan_only=False, timeout_sec=120):
+def stop_auto_confirm_fuse_and_expand_plan(page):
+    """Stop any countdown fuse on the confirmation card and expand '더보기' in research-steps."""
+    cancel_fuse = page.locator('[data-test-id="cancel-fuse-button"] button, [data-test-id="cancel-fuse-button"]').last
+    if cancel_fuse.count() > 0 and cancel_fuse.is_visible():
+        try:
+            cancel_fuse.click(force=True)
+            time.sleep(0.3)
+        except Exception:
+            pass
+
+    plan_el = page.locator('[data-test-id="research-steps"], .research-steps').last
+    if plan_el.count() > 0:
+        more_btns = plan_el.locator('button:has-text("더보기"), gem-button:has-text("더보기"), button:has-text("More")')
+        for i in range(more_btns.count()):
+            try:
+                more_btns.nth(i).click(force=True)
+                time.sleep(0.2)
+            except Exception:
+                pass
+        return plan_el.inner_text().strip()
+    return ""
+
+
+def wait_for_response_complete(page, expected_min_responses, timeout_sec=60):
+    """Wait until model-response count >= expected_min_responses and the last response has .response-footer.complete."""
+    start = time.time()
+    while time.time() - start < timeout_sec:
+        done = page.evaluate(
+            """(minResp) => {
+                const resps = Array.from(document.querySelectorAll('model-response'));
+                if (resps.length < minResp) return false;
+                const last = resps[resps.length - 1];
+                const footerComplete = !!last.querySelector('.response-footer.complete');
+                const md = last.querySelector('.markdown');
+                const ariaBusy = md ? md.getAttribute('aria-busy') : 'true';
+                return footerComplete && ariaBusy === 'false';
+            }""",
+            expected_min_responses,
+        )
+        if done:
+            return True
+        time.sleep(0.8)
+    return False
+
+
+def wait_for_new_plan(page, prev_plan_count=0, timeout_sec=120):
+    """Wait until a new Research Plan card with an active confirm button appears."""
     start_time = time.time()
-    reloaded_once = False
+    last_reload_at = 0
     while time.time() - start_time < timeout_sec:
         elapsed = time.time() - start_time
 
-        # Check for filter refusal message
         resp_el = page.locator("model-response").last
         if resp_el.count() > 0:
             resp_txt = resp_el.inner_text().strip()
@@ -268,33 +339,179 @@ def wait_for_and_confirm_plan(page, plan_only=False, timeout_sec=120):
                     "Avoid sensitive political/election keywords (e.g., '민주주의', '선거', '정치')."
                 )
 
-        confirm_btn = page.locator(
-            '[data-test-id="confirm-button"], gem-button[data-test-id="confirm-button"], button[aria-label="연구 시작"], button:has-text("연구 시작"), button:has-text("Start research")'
-        ).first
-        if confirm_btn.count() > 0:
-            plan_el = page.locator('[data-test-id="research-steps"], .research-steps').last
-            plan_text = plan_el.inner_text().strip() if plan_el.count() > 0 else ""
-            log("Research Plan generated!")
-            if plan_text:
-                print("\n--- [Research Plan] ---\n" + plan_text + "\n-----------------------\n", flush=True)
+        current_plan_count = page.locator('[data-test-id="research-steps"], .research-steps').count()
+        active_confirm = page.locator(
+            '[data-test-id="confirm-button"]:not(.gem-button-disabled) button:not([disabled]), '
+            'button[aria-label="연구 시작"]:not([disabled])'
+        )
 
-            if plan_only:
-                return {"status": "plan_ready", "url": page.url, "plan": plan_text}
+        if current_plan_count > prev_plan_count and active_confirm.count() > 0:
+            time.sleep(0.8)
+            plan_text = stop_auto_confirm_fuse_and_expand_plan(page)
+            return {
+                "status": "plan_ready",
+                "url": page.url,
+                "plan": plan_text,
+                "plan_count": current_plan_count,
+            }
 
-            log("Clicking '연구 시작' (Confirm Plan) to start Deep Research execution...")
-            confirm_btn.click(force=True)
-            time.sleep(2.0)
-            return {"status": "started", "url": page.url, "plan": plan_text}
-
-        if elapsed > 45 and not reloaded_once and "/app/" in page.url:
-            reloaded_once = True
-            log("Plan generation taking >45s; reloading conversation page once to refresh state...")
+        # When Gemini.exe runs hidden (--hide), revised Research Plan widgets on follow-up turns
+        # may stay visually on '조사 계획 생성 중' until the conversation page is reloaded.
+        if elapsed - last_reload_at >= 25 and "/app/" in page.url:
+            last_reload_at = elapsed
+            log(f"Refreshing conversation state ({int(elapsed)}s elapsed)...")
             page.reload(wait_until="domcontentloaded")
-            time.sleep(3.0)
+            try:
+                page.wait_for_selector("model-response", timeout=15000)
+            except Exception:
+                pass
+            time.sleep(2.5)
+            continue
 
-        time.sleep(2.0)
+        time.sleep(1.5)
 
     raise TimeoutError(f"Research Plan confirmation button did not appear within {timeout_sec}s.")
+
+
+def apply_plan_edit(page, edit_feedback, timeout_sec=120):
+    """Click '계획 수정' (edit-button), wait for edit prompt readiness, submit modification instructions, and wait for the revised plan."""
+    ensure_pro_mode(page)
+    prev_plan_count = page.locator('[data-test-id="research-steps"], .research-steps').count()
+    prev_resp_count = page.locator("model-response").count()
+
+    edit_btn = page.locator(
+        '[data-test-id="edit-button"]:not(.gem-button-disabled) button:not([disabled]), '
+        '[data-test-id="edit-button"]:not(.gem-button-disabled), '
+        'button[aria-label="연구 계획 수정"]:not([disabled])'
+    ).last
+
+    if edit_btn.count() > 0:
+        log("Clicking '계획 수정' (edit-button)...")
+        edit_btn.evaluate("el => el.click()")
+        # Clicking '계획 수정' triggers a canned turn ("연구 계획 수정" -> "현재 계획이에요. 변경하고 싶은 부분이 있나요?")
+        # Wait for that intermediate response to complete (.response-footer.complete) before submitting our modification prompt.
+        wait_for_response_complete(page, expected_min_responses=prev_resp_count + 1, timeout_sec=45)
+        time.sleep(0.8)
+
+    log(f"Submitting plan modification request: {edit_feedback}")
+    submit_prompt(page, edit_feedback, raw_prompt=True)
+    log("Waiting for revised Research Plan generation...")
+    return wait_for_new_plan(page, prev_plan_count=prev_plan_count, timeout_sec=timeout_sec)
+
+
+def confirm_current_plan(page):
+    """Click '연구 시작' (confirm-button) on the latest Research Plan."""
+    confirm_btn = page.locator(
+        '[data-test-id="confirm-button"]:not(.gem-button-disabled) button:not([disabled]), '
+        '[data-test-id="confirm-button"]:not(.gem-button-disabled), '
+        'button[aria-label="연구 시작"]:not([disabled])'
+    ).last
+    if confirm_btn.count() == 0:
+        raise RuntimeError("No active '연구 시작' (confirm-button) found on the current page.")
+    log("Clicking '연구 시작' (Confirm Plan) to start Deep Research execution...")
+    confirm_btn.evaluate("el => el.click()")
+    time.sleep(2.0)
+
+
+def parse_hook_decision(raw_response):
+    """
+    Parse decision from hook stdout or caller agent stdin.
+    Accepted formats:
+      - JSON: {"action": "approve"} or {"action": "edit", "feedback": "..."}
+      - Text: "APPROVE" / "OK" / "YES"
+      - Text: "EDIT: <modification instructions>"
+      - Any other non-empty string is treated as modification instructions ("edit").
+    """
+    text = (raw_response or "").strip()
+    if not text:
+        return {"action": "approve", "feedback": ""}
+
+    if text.startswith("{") and text.endswith("}"):
+        try:
+            obj = json.loads(text)
+            act = str(obj.get("action", "")).lower().strip()
+            fb = str(obj.get("feedback") or obj.get("edit_prompt") or obj.get("plan") or "").strip()
+            if act in ("approve", "approved", "confirm", "start", "ok", "yes"):
+                return {"action": "approve", "feedback": ""}
+            return {"action": "edit", "feedback": fb}
+        except Exception:
+            pass
+
+    upper = text.upper()
+    if upper in ("APPROVE", "APPROVED", "CONFIRM", "START", "OK", "YES", "승인"):
+        return {"action": "approve", "feedback": ""}
+
+    if upper.startswith("EDIT:"):
+        return {"action": "edit", "feedback": text[5:].strip()}
+    if text.startswith("수정:"):
+        return {"action": "edit", "feedback": text[3:].strip()}
+
+    return {"action": "edit", "feedback": text}
+
+
+def run_plan_review_hook_loop(page, initial_plan_info, plan_hook_cmd=None, timeout_sec=120):
+    """
+    Hook & Loop executed when a Research Plan is provided:
+    1. Emits the generated plan to the caller agent (or executes --plan-hook command).
+    2. Receives verification result:
+       - If modification instructions are returned -> modifies the plan in Gemini, gets revised plan, and repeats verification.
+       - If approved -> exits the loop and starts Deep Research execution.
+    """
+    current_plan = initial_plan_info
+    iteration = 1
+
+    while True:
+        payload = {
+            "event": "on_plan_generated",
+            "iteration": iteration,
+            "url": current_plan["url"],
+            "plan": current_plan["plan"],
+        }
+
+        print("\n=== [PLAN_REVIEW_HOOK_START] ===", flush=True)
+        print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+        print("=== [PLAN_REVIEW_HOOK_END] ===\n", flush=True)
+
+        if plan_hook_cmd:
+            log(f"Executing plan hook command (iteration {iteration}): {plan_hook_cmd}")
+            proc = subprocess.run(
+                plan_hook_cmd,
+                input=json.dumps(payload, ensure_ascii=False),
+                text=True,
+                encoding="utf-8",
+                shell=True,
+                capture_output=True,
+            )
+            if proc.returncode != 0:
+                log(f"Warning: plan hook exited with code {proc.returncode}: {proc.stderr}")
+            decision = parse_hook_decision(proc.stdout)
+        else:
+            log(
+                f"[Iteration {iteration}] Waiting for caller agent plan review on stdin "
+                "(Send 'APPROVE' to start research, or 'EDIT: <수정 내용>' to revise the plan)..."
+            )
+            line = sys.stdin.readline()
+            if not line:
+                raise RuntimeError(
+                    "Stdin closed while waiting for plan review decision. "
+                    "Use manage_task(Action='send_input', Input='APPROVE\\n') or '--step plan/edit/approve'."
+                )
+            decision = parse_hook_decision(line)
+
+        if decision["action"] == "approve":
+            log(f"Plan approved at iteration {iteration}! Exiting review loop and starting research.")
+            confirm_current_plan(page)
+            return current_plan
+
+        feedback = decision["feedback"]
+        if not feedback:
+            log("Empty edit feedback received; treating as approval.")
+            confirm_current_plan(page)
+            return current_plan
+
+        log(f"[Iteration {iteration}] Plan revision requested by caller agent: {feedback}")
+        current_plan = apply_plan_edit(page, feedback, timeout_sec=timeout_sec)
+        iteration += 1
 
 
 def wait_for_report_completion(page, timeout_sec=1200):
@@ -391,7 +608,6 @@ def wait_for_report_completion(page, timeout_sec=1200):
     else:
         raise TimeoutError(f"Deep Research did not finish within {timeout_sec} seconds.")
 
-    # Extract formatted Markdown + sources
     extracted = page.evaluate(HTML_TO_MARKDOWN_JS, None)
     markdown = extracted.get("markdown", "").strip()
     sources = extracted.get("sources", [])
@@ -412,14 +628,51 @@ def wait_for_report_completion(page, timeout_sec=1200):
 def main():
     parser = argparse.ArgumentParser(description="Run Deep Research using the local Windows Gemini desktop app.")
     parser.add_argument("--prompt", type=str, help="Research prompt/topic to investigate.")
+    parser.add_argument(
+        "--raw-prompt",
+        action="store_true",
+        help="Use the exact prompt string provided at invocation time without any modification.",
+    )
     parser.add_argument("--output", type=str, help="Optional file path to save the resulting Markdown report.")
-    parser.add_argument("--plan-only", action="store_true", help="Stop after generating the Research Plan without starting execution.")
-    parser.add_argument("--resume-url", type=str, help="Resume an existing Deep Research conversation URL.")
-    parser.add_argument("--timeout", type=int, default=900, help="Max wait time in seconds for research completion (default: 900).")
+    parser.add_argument(
+        "--review-plan",
+        action="store_true",
+        help="Enable the Plan Review Hook loop: returns the generated plan to the caller agent for verification/revision before starting research.",
+    )
+    parser.add_argument(
+        "--plan-hook",
+        type=str,
+        help="Optional shell command to run when a plan is generated. Receives plan JSON on stdin and outputs 'APPROVE' or 'EDIT: <instructions>'.",
+    )
+    parser.add_argument(
+        "--step",
+        choices=["auto", "plan", "edit", "approve"],
+        default="auto",
+        help=(
+            "Step-by-step loop control for caller agents: "
+            "'plan' (generate plan and return to caller), "
+            "'edit' (modify existing plan with --edit-prompt and return revised plan), "
+            "'approve' (confirm current plan and execute Deep Research), "
+            "'auto' (default full flow)."
+        ),
+    )
+    parser.add_argument(
+        "--edit-prompt",
+        type=str,
+        help="Modification instructions when using '--step edit'.",
+    )
+    parser.add_argument("--plan-only", action="store_true", help="Alias for '--step plan'.")
+    parser.add_argument("--resume-url", type=str, help="Resume an existing Deep Research conversation URL (or 'current').")
+    parser.add_argument("--timeout", type=int, default=1200, help="Max wait time in seconds for research completion (default: 1200).")
     parser.add_argument("--show", action="store_true", help="Show the local Gemini desktop window instead of running hidden.")
     args = parser.parse_args()
 
-    if not args.prompt and not args.resume_url:
+    if args.plan_only:
+        args.step = "plan"
+
+    if args.step == "edit" and not args.edit_prompt:
+        parser.error("--edit-prompt is required when --step edit is used.")
+    if args.step in ("auto", "plan") and not args.prompt and not args.resume_url:
         parser.error("Either --prompt or --resume-url must be provided.")
 
     app_info = ensure_gemini_running_with_cdp(port=CDP_PORT, hide=not args.show)
@@ -430,39 +683,64 @@ def main():
         page = get_gemini_page(browser)
         prevent_background_throttling(page)
 
-        if args.resume_url:
-            if args.resume_url != "current" and page.url != args.resume_url:
-                log(f"Navigating to existing conversation: {args.resume_url}")
-                page.goto(args.resume_url, wait_until="domcontentloaded")
-                time.sleep(2.5)
-            plan_el = page.locator('[data-test-id="research-steps"], .research-steps').last
-            if plan_el.count() > 0:
-                print("\n--- [Research Plan] ---\n" + plan_el.inner_text().strip() + "\n-----------------------\n", flush=True)
-            confirm_btn = page.locator('[data-test-id="confirm-button"]:not(.gem-button-disabled) button:not([disabled])').first
+        if args.resume_url and args.resume_url != "current" and page.url != args.resume_url:
+            log(f"Navigating to conversation: {args.resume_url}")
+            page.goto(args.resume_url, wait_until="domcontentloaded")
+            time.sleep(2.5)
+
+        # Step mode 1: Edit an existing plan and return the revised plan to the caller agent
+        if args.step == "edit":
+            revised = apply_plan_edit(page, args.edit_prompt)
+            print("\n=== [PLAN_REVIEW_HOOK_START] ===", flush=True)
+            print(json.dumps({"event": "on_plan_revised", **revised}, ensure_ascii=False, indent=2), flush=True)
+            print("=== [PLAN_REVIEW_HOOK_END] ===\n", flush=True)
+            return
+
+        # Step mode 2: Approve the currently displayed plan and execute Deep Research
+        if args.step == "approve":
+            confirm_btn = page.locator('[data-test-id="confirm-button"]:not(.gem-button-disabled) button:not([disabled])').last
             if confirm_btn.count() > 0:
-                log("Confirming pending Research Plan ('연구 시작')...")
-                confirm_btn.click(force=True)
-                time.sleep(2.0)
+                confirm_current_plan(page)
+        elif args.resume_url:
+            confirm_btn = page.locator('[data-test-id="confirm-button"]:not(.gem-button-disabled) button:not([disabled])').last
+            if confirm_btn.count() > 0:
+                if args.review_plan or args.plan_hook:
+                    plan_text = stop_auto_confirm_fuse_and_expand_plan(page)
+                    run_plan_review_hook_loop(
+                        page,
+                        {"status": "plan_ready", "url": page.url, "plan": plan_text},
+                        plan_hook_cmd=args.plan_hook,
+                    )
+                else:
+                    confirm_current_plan(page)
         else:
+            # Start a new Deep Research chat
             if page.url.rstrip("/") != "https://gemini.google.com/app":
                 log("Opening new chat in local Gemini app...")
-                new_chat_btn = page.locator('[data-test-id="new-chat-button"] button, a[aria-label="새 채팅"], a[aria-label="New chat"]').first
-                if new_chat_btn.count() > 0:
-                    new_chat_btn.click(force=True)
-                    time.sleep(1.5)
-                else:
-                    page.goto("https://gemini.google.com/app", wait_until="domcontentloaded")
-                    time.sleep(3.5)
+                page.goto("https://gemini.google.com/app", wait_until="domcontentloaded")
+                time.sleep(3.0)
             activate_deep_research_mode(page)
-            submit_prompt(page, args.prompt)
-            plan_res = wait_for_and_confirm_plan(page, plan_only=args.plan_only)
-            if args.plan_only:
+            submit_prompt(page, args.prompt, raw_prompt=args.raw_prompt)
+            plan_res = wait_for_new_plan(page, prev_plan_count=0)
+
+            print("\n--- [Research Plan] ---\n" + plan_res["plan"] + "\n-----------------------\n", flush=True)
+
+            # If --step plan, emit the hook payload and return immediately to caller agent
+            if args.step == "plan":
+                print("\n=== [PLAN_REVIEW_HOOK_START] ===", flush=True)
+                print(json.dumps({"event": "on_plan_generated", **plan_res}, ensure_ascii=False, indent=2), flush=True)
+                print("=== [PLAN_REVIEW_HOOK_END] ===\n", flush=True)
                 if args.output:
                     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
                     with open(args.output, "w", encoding="utf-8") as f:
                         f.write(f"# Research Plan\n\nURL: {plan_res['url']}\n\n{plan_res['plan']}\n")
-                print(json.dumps(plan_res, ensure_ascii=False, indent=2))
                 return
+
+            # If --review-plan or --plan-hook is enabled, enter the interactive verification/revision loop
+            if args.review_plan or args.plan_hook:
+                run_plan_review_hook_loop(page, plan_res, plan_hook_cmd=args.plan_hook)
+            else:
+                confirm_current_plan(page)
 
         result = wait_for_report_completion(page, timeout_sec=args.timeout)
         if args.output:
