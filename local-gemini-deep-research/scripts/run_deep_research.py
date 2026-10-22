@@ -272,7 +272,7 @@ def submit_prompt(page, prompt_text, raw_prompt=False):
 
     send_btn = page.locator('button[aria-label="메시지 보내기"], button[aria-label*="Send"]').first
     if send_btn.count() > 0:
-        send_btn.click()
+        send_btn.evaluate("el => el.click()")
     else:
         textbox.press("Enter")
     log("Prompt submitted.")
@@ -323,7 +323,7 @@ def wait_for_response_complete(page, expected_min_responses, timeout_sec=60):
     return False
 
 
-def wait_for_new_plan(page, prev_plan_count=0, timeout_sec=120):
+def wait_for_new_plan(page, prev_plan_count=0, timeout_sec=180):
     """Wait until a new Research Plan card with an active confirm button appears."""
     start_time = time.time()
     last_reload_at = 0
@@ -357,7 +357,8 @@ def wait_for_new_plan(page, prev_plan_count=0, timeout_sec=120):
 
         # When Gemini.exe runs hidden (--hide), revised Research Plan widgets on follow-up turns
         # may stay visually on '조사 계획 생성 중' until the conversation page is reloaded.
-        if elapsed - last_reload_at >= 25 and "/app/" in page.url:
+        # Wait at least 60s before reloading so we never abort an in-flight StreamGenerate request.
+        if elapsed - last_reload_at >= 60 and "/app/" in page.url:
             last_reload_at = elapsed
             log(f"Refreshing conversation state ({int(elapsed)}s elapsed)...")
             page.reload(wait_until="domcontentloaded")
@@ -365,7 +366,7 @@ def wait_for_new_plan(page, prev_plan_count=0, timeout_sec=120):
                 page.wait_for_selector("model-response", timeout=15000)
             except Exception:
                 pass
-            time.sleep(2.5)
+            time.sleep(3.0)
             continue
 
         time.sleep(1.5)
@@ -373,7 +374,7 @@ def wait_for_new_plan(page, prev_plan_count=0, timeout_sec=120):
     raise TimeoutError(f"Research Plan confirmation button did not appear within {timeout_sec}s.")
 
 
-def apply_plan_edit(page, edit_feedback, timeout_sec=120):
+def apply_plan_edit(page, edit_feedback, timeout_sec=180):
     """Click '계획 수정' (edit-button), wait for edit prompt readiness, submit modification instructions, and wait for the revised plan."""
     ensure_pro_mode(page)
     prev_plan_count = page.locator('[data-test-id="research-steps"], .research-steps').count()
@@ -628,6 +629,7 @@ def wait_for_report_completion(page, timeout_sec=1200):
 def main():
     parser = argparse.ArgumentParser(description="Run Deep Research using the local Windows Gemini desktop app.")
     parser.add_argument("--prompt", type=str, help="Research prompt/topic to investigate.")
+    parser.add_argument("--prompt-file", type=str, help="Path to a UTF-8 file containing the exact research prompt.")
     parser.add_argument(
         "--raw-prompt",
         action="store_true",
@@ -661,11 +663,24 @@ def main():
         type=str,
         help="Modification instructions when using '--step edit'.",
     )
+    parser.add_argument(
+        "--edit-prompt-file",
+        type=str,
+        help="Path to a UTF-8 file containing modification instructions when using '--step edit'.",
+    )
     parser.add_argument("--plan-only", action="store_true", help="Alias for '--step plan'.")
     parser.add_argument("--resume-url", type=str, help="Resume an existing Deep Research conversation URL (or 'current').")
     parser.add_argument("--timeout", type=int, default=1200, help="Max wait time in seconds for research completion (default: 1200).")
     parser.add_argument("--show", action="store_true", help="Show the local Gemini desktop window instead of running hidden.")
     args = parser.parse_args()
+
+    if args.prompt_file:
+        with open(args.prompt_file, "r", encoding="utf-8") as f:
+            args.prompt = f.read().strip()
+
+    if args.edit_prompt_file:
+        with open(args.edit_prompt_file, "r", encoding="utf-8") as f:
+            args.edit_prompt = f.read().strip()
 
     if args.plan_only:
         args.step = "plan"
