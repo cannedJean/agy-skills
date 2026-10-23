@@ -184,19 +184,29 @@ def prevent_background_throttling(page):
 
 
 def ensure_pro_mode(page):
-    """Ensure '3.8 Flash' model is selected so Deep Research and multi-turn plan editing are always enabled and fast."""
-    mode_btn = page.locator('[data-test-id="bard-mode-menu-button"]').first
+    """Ensure 'Pro' (e.g. '3.8 Pro') model is selected instead of 'Argon' so Deep Research runs on Pro."""
+    try:
+        page.wait_for_selector('[data-test-id="bard-mode-menu-button"], bard-mode-switcher button', timeout=10000)
+    except Exception:
+        pass
+    mode_btn = page.locator('[data-test-id="bard-mode-menu-button"], bard-mode-switcher button').first
     if mode_btn.count() > 0:
         current_mode = mode_btn.inner_text().strip()
-        if current_mode != "Flash":
+        if "Pro" not in current_mode:
+            log(f"Current model mode is '{current_mode}'. Switching to 'Pro'...")
             mode_btn.evaluate("el => el.click()")
             time.sleep(0.8)
             switched = page.evaluate(
                 """() => {
-                    const item = Array.from(document.querySelectorAll('gem-menu-item, [role="menuitemradio"], [role="menuitem"]'))
-                        .find(el => el.innerText.includes('3.8 Flash') || (el.innerText.includes('Flash') && !el.innerText.includes('Lite')));
-                    if (item) {
-                        (item.querySelector('button') || item).click();
+                    const items = Array.from(document.querySelectorAll(
+                        'button[role="menuitemradio"], button[role="menuitem"], [role="menuitemradio"], [role="menuitem"], mat-option'
+                    ));
+                    const proItem = items.find(el => {
+                        const txt = (el.innerText || '').trim();
+                        return txt.includes('Pro') && !el.disabled && el.getAttribute('aria-disabled') !== 'true';
+                    });
+                    if (proItem) {
+                        (proItem.querySelector('button') || proItem).click();
                         return true;
                     }
                     return false;
@@ -206,7 +216,10 @@ def ensure_pro_mode(page):
                 time.sleep(1.0)
                 log(f"Switched model mode to: {mode_btn.inner_text().strip()}")
             else:
+                log("Warning: Could not find enabled 'Pro' option in mode menu.")
                 page.keyboard.press("Escape")
+        else:
+            log(f"Model mode already set to: {current_mode}")
 
 
 def activate_deep_research_mode(page):
@@ -702,6 +715,8 @@ def main():
             log(f"Navigating to conversation: {args.resume_url}")
             page.goto(args.resume_url, wait_until="domcontentloaded")
             time.sleep(2.5)
+
+        ensure_pro_mode(page)
 
         # Step mode 1: Edit an existing plan and return the revised plan to the caller agent
         if args.step == "edit":
