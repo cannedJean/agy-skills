@@ -4,7 +4,10 @@ import os
 import subprocess
 import sys
 import time
-from playwright.sync_api import sync_playwright
+try:
+    from playwright.sync_api import sync_playwright
+except ImportError:
+    sync_playwright = None
 
 # Ensure UTF-8 output on Windows consoles
 if hasattr(sys.stdout, "reconfigure"):
@@ -162,6 +165,144 @@ def log(msg):
     print(f"[{ts}] {msg}", flush=True)
 
 
+REQUIRED_XML_TAGS = (
+    "research_objective",
+    "context_and_scope",
+    "investigation_axes",
+    "source_governance",
+    "output_format",
+)
+
+
+def has_full_xml_prompt_structure(text: str) -> bool:
+    import re
+    clean = (text or "").strip()
+    return all(
+        re.search(rf"<{tag}\b[^>]*>.*?</{tag}>", clean, re.S | re.I)
+        for tag in REQUIRED_XML_TAGS
+    )
+
+
+def build_structured_xml_prompt(
+    objective: str,
+    context_scope: str | None = None,
+    axes: list[str] | None = None,
+    sources_policy: str | None = None,
+    output_spec: str | None = None,
+    workspace_sources: str | None = None,
+) -> str:
+    """Wrap a topic/objective into the 5-block XML Deep Research architecture."""
+    import re
+    obj_clean = (objective or "").strip()
+    if not re.match(
+        r"^(?:compare|analyze|synthesize|evaluate|investigate|conduct|design|benchmark|분석|비교|종합|평가|조사|검증)",
+        obj_clean,
+        re.I,
+    ):
+        obj_block = (
+            "Conduct a comprehensive, multi-dimensional technical analysis and comparative synthesis on the following topic:\n"
+            f"{obj_clean}"
+        )
+    else:
+        obj_block = obj_clean
+
+    ctx_lines = []
+    if context_scope and str(context_scope).strip():
+        ctx_lines.append(str(context_scope).strip())
+    else:
+        ctx_lines.append(
+            "- Scope: Self-contained multi-source investigation covering 2022–2026 production architectures, peer-reviewed literature, and empirical benchmarks.\n"
+            "- Exclusions: Skip introductory textbook definitions and superficial marketing overview pages. Do not ask clarifying questions; execute the investigation directly under these declared scope bounds."
+        )
+    if workspace_sources and str(workspace_sources).strip():
+        ctx_lines.append(
+            f"- Google Workspace Data Layer Integration: Cross-reference authenticated Google Workspace entities (Drive documents/folders, Gmail threads, Google Chat) matching: {str(workspace_sources).strip()}"
+        )
+    ctx_block = "\n".join(ctx_lines)
+
+    if axes:
+        axes_items = [str(x).strip() for x in axes if str(x).strip()]
+    else:
+        axes_items = [
+            "1. Core Architecture & Algorithmic Mechanics: Analyze underlying data structures, system invariants, and implementation trade-offs.",
+            "2. Empirical Performance & Resource Benchmarks: Compare throughput, tail latency (p50/p95/p99), compute/memory footprint, and scalability limits.",
+            "3. Operational Resilience & Edge Cases: Evaluate failure modes, recovery protocols, security/compliance implications, and production bottlenecks.",
+        ]
+    axes_numbered = []
+    for idx, item in enumerate(axes_items, 1):
+        if re.match(r"^\d+[\.)]\s+", item):
+            axes_numbered.append(item)
+        else:
+            axes_numbered.append(f"{idx}. {item}")
+    axes_numbered.append(
+        "Conditional Depth-First Trigger: When primary sources or benchmarks report conflicting quantitative metrics, trace the underlying hardware specifications, dataset distributions, and measurement methodologies in the primary text to explain the discrepancy."
+    )
+    axes_block = "\n".join(axes_numbered)
+
+    if sources_policy and str(sources_policy).strip():
+        custom_src = str(sources_policy).strip()
+        if "검증 가능한 공개 근거 불충분" not in custom_src:
+            src_block = (
+                f"{custom_src}\n"
+                "- Epistemic Calibration: Strictly separate confirmed empirical facts from architectural hypotheses. If verified public evidence is unavailable for any metric or claim, explicitly state '검증 가능한 공개 근거 불충분 (Insufficient verified evidence)' rather than extrapolating or fabricating numbers."
+            )
+        else:
+            src_block = custom_src
+    else:
+        src_block = (
+            "- Prioritize Tier-1 primary sources: peer-reviewed papers (with DOI/arXiv links), official engineering specifications, standard bodies, and reproducible benchmark repositories.\n"
+            "- Do not rely on unverified secondary blogs or vendor marketing claims as sole evidence.\n"
+            "- Provide numbered inline citations with publication/verification dates and direct URLs.\n"
+            "- Epistemic Calibration: Strictly separate confirmed empirical facts from architectural hypotheses. If verified public evidence is unavailable for any metric or claim, explicitly state '검증 가능한 공개 근거 불충분 (Insufficient verified evidence)' rather than extrapolating or fabricating numbers."
+        )
+
+    if output_spec and str(output_spec).strip():
+        out_block = (
+            f"{str(output_spec).strip()}\n"
+            "- Mandatory Gate Invariant: Output MUST be valid GitHub-Flavored Markdown (GFM) of at least 2,500 characters (strictly >= 400 characters) with explicit top-level `#` and section `##` Markdown headings. If structured JSON is requested, embed it inside a fenced ```json code block under a dedicated `##` Markdown section."
+        )
+    else:
+        out_block = (
+            "- Format: Comprehensive GitHub-Flavored Markdown (GFM) technical report (>= 2,500 characters; strictly >= 400 characters).\n"
+            "- Mandatory Heading Hierarchy:\n"
+            "  # [Report Title]\n"
+            "  ## 1. Executive Summary & Architectural Verdict\n"
+            "  ## 2. Deep-Dive Technical Analysis by Investigation Axis\n"
+            "  ## 3. Quantitative Comparison Matrix (Markdown Table with fixed metric columns)\n"
+            "  ## 4. Risk Analysis, Edge Cases & Production Recommendations\n"
+            "  ## 참고 출처 (Sources)"
+        )
+
+    return (
+        f"<research_objective>\n{obj_block}\n</research_objective>\n\n"
+        f"<context_and_scope>\n{ctx_block}\n</context_and_scope>\n\n"
+        f"<investigation_axes>\n{axes_block}\n</investigation_axes>\n\n"
+        f"<source_governance>\n{src_block}\n</source_governance>\n\n"
+        f"<output_format>\n{out_block}\n</output_format>"
+    )
+
+
+def validate_edit_instructions(edit_prompt: str, allow_questions: bool = False) -> str:
+    import re
+    clean = (edit_prompt or "").strip()
+    if not clean:
+        raise ValueError("--edit-prompt cannot be empty.")
+    if not allow_questions:
+        patterns = (
+            re.compile(r"\?\s*$", re.M),
+            re.compile(r"^\s*(?:why|how\s+come|what\s+is\s+the\s+reason|can\s+you\s+explain|could\s+you\s+explain)\b", re.I | re.M),
+            re.compile(r"(?:왜\s+[^\n]*?(?:인가요|입니까|했나요|선택했나요|포함했나요)|이유가\s+무엇|설명해\s*주세|답변해\s*주세)", re.M),
+        )
+        for pat in patterns:
+            if pat.search(clean):
+                raise ValueError(
+                    "Edit feedback contains conversational questions (e.g. '?'). Asking questions during plan editing "
+                    "causes Gemini to reply with prose instead of generating a revised Research Plan card (PLAN_CHANGED / PLAN_TIMEOUT). "
+                    "Use imperative delta instructions only (Add, Remove, Reorder, Pin)."
+                )
+    return clean
+
+
 def get_gemini_page(browser, timeout_sec=15):
     deadline = time.time() + timeout_sec
     while time.time() < deadline:
@@ -184,42 +325,131 @@ def prevent_background_throttling(page):
 
 
 def ensure_pro_mode(page):
-    """Ensure 'Pro' (e.g. '3.8 Pro') model is selected instead of 'Argon' so Deep Research runs on Pro."""
+    """Ensure the wanted model mode and thinking level are selected. Default 'Pro' / 'high';
+    GEMINI_DR_MODE selects model, GEMINI_DR_THINKING selects reasoning intensity."""
+    target = os.environ.get("GEMINI_DR_MODE", "Pro").strip() or "Pro"
+    thinking_target = os.environ.get("GEMINI_DR_THINKING", "high").strip() or "high"
+    mode_selectors = [
+        '[data-test-id*="mode-menu"]',
+        'button[aria-label*="Model selector"]',
+        'button[aria-label*="모델 선택"]',
+        'gem-menu-button button',
+        'gem-menu-button',
+        'button[aria-label*="Gemini"]',
+        '[data-test-id="bard-mode-menu-button"]',
+        'bard-mode-switcher button',
+    ]
+    combined_selector = ", ".join(mode_selectors)
     try:
-        page.wait_for_selector('[data-test-id="bard-mode-menu-button"], bard-mode-switcher button', timeout=10000)
+        page.wait_for_selector(combined_selector, timeout=10000)
     except Exception:
         pass
-    mode_btn = page.locator('[data-test-id="bard-mode-menu-button"], bard-mode-switcher button').first
+
+    mode_btn = None
+    for sel in mode_selectors:
+        loc = page.locator(sel).first
+        try:
+            if loc.count() > 0 and loc.is_visible():
+                mode_btn = loc
+                break
+        except Exception:
+            continue
+
+    if not mode_btn:
+        mode_btn = page.locator(combined_selector).first
+
     if mode_btn.count() > 0:
-        current_mode = mode_btn.inner_text().strip()
-        if "Pro" not in current_mode:
-            log(f"Current model mode is '{current_mode}'. Switching to 'Pro'...")
+        current_mode = str(mode_btn.inner_text() or mode_btn.get_attribute("aria-label") or "").strip()
+        if target.lower() not in current_mode.lower():
+            log(f"Current model mode is '{current_mode}'. Switching to '{target}'...")
             mode_btn.evaluate("el => el.click()")
             time.sleep(0.8)
             switched = page.evaluate(
-                """() => {
+                """(target) => {
+                    const targetLower = target.toLowerCase();
                     const items = Array.from(document.querySelectorAll(
                         'button[role="menuitemradio"], button[role="menuitem"], [role="menuitemradio"], [role="menuitem"], mat-option'
                     ));
                     const proItem = items.find(el => {
-                        const txt = (el.innerText || '').trim();
-                        return txt.includes('Pro') && !el.disabled && el.getAttribute('aria-disabled') !== 'true';
+                        const txt = (el.innerText || '').trim().toLowerCase();
+                        return txt.includes(targetLower) && !el.disabled && el.getAttribute('aria-disabled') !== 'true';
                     });
                     if (proItem) {
                         (proItem.querySelector('button') || proItem).click();
                         return true;
                     }
                     return false;
-                }"""
+                }""", target
             )
             if switched:
                 time.sleep(1.0)
-                log(f"Switched model mode to: {mode_btn.inner_text().strip()}")
+                new_mode = str(mode_btn.inner_text() or mode_btn.get_attribute("aria-label") or "").strip()
+                log(f"Switched model mode to: {new_mode}")
             else:
-                log("Warning: Could not find enabled 'Pro' option in mode menu.")
+                log(f"Warning: Could not find enabled '{target}' option in mode menu.")
                 page.keyboard.press("Escape")
         else:
             log(f"Model mode already set to: {current_mode}")
+
+    # Select thinking level if UI controls are present
+    thinking_selectors = [
+        '[data-test-id*="thinking"]',
+        'button[aria-label*="Thinking"]',
+        'button[aria-label*="사고"]',
+        'button[aria-label*="thinking"]',
+        '[aria-label*="Thinking level"]',
+        '[aria-label*="사고 수준"]',
+    ]
+    try:
+        thinking_btn = None
+        for sel in thinking_selectors:
+            loc = page.locator(sel).first
+            try:
+                if loc.count() > 0 and loc.is_visible():
+                    thinking_btn = loc
+                    break
+            except Exception:
+                continue
+
+        if thinking_btn and thinking_btn.count() > 0:
+            current_thinking = str(thinking_btn.inner_text() or thinking_btn.get_attribute("aria-label") or "").strip()
+            thinking_map = {
+                "high": ["high", "높음"],
+                "medium": ["medium", "중간", "보통"],
+                "low": ["low", "낮음"],
+            }
+            targets = thinking_map.get(thinking_target.lower(), [thinking_target.lower()])
+            already_match = any(t in current_thinking.lower() for t in targets)
+            if not already_match:
+                log(f"Current thinking level is '{current_thinking}'. Switching to '{thinking_target}'...")
+                thinking_btn.evaluate("el => el.click()")
+                time.sleep(0.8)
+                switched_th = page.evaluate(
+                    """(targets) => {
+                        const items = Array.from(document.querySelectorAll(
+                            'button[role="menuitemradio"], button[role="menuitem"], [role="menuitemradio"], [role="menuitem"], mat-option, [role="option"]'
+                        ));
+                        const matchItem = items.find(el => {
+                            const txt = (el.innerText || '').trim().toLowerCase();
+                            return targets.some(t => txt.includes(t)) && !el.disabled && el.getAttribute('aria-disabled') !== 'true';
+                        });
+                        if (matchItem) {
+                            (matchItem.querySelector('button') || matchItem).click();
+                            return true;
+                        }
+                        return false;
+                    }""", targets
+                )
+                if switched_th:
+                    time.sleep(0.5)
+                    log(f"Switched thinking level to: {thinking_target}")
+                else:
+                    log(f"Notice: Thinking option '{thinking_target}' not found in menu.")
+                    page.keyboard.press("Escape")
+            else:
+                log(f"Thinking level already set to: {current_thinking}")
+    except Exception as e:
+        log(f"Notice: Thinking level selection check skipped ({e})")
 
 
 def activate_deep_research_mode(page):
@@ -355,7 +585,11 @@ def wait_for_new_plan(page, prev_plan_count=0, timeout_sec=180):
         current_plan_count = page.locator('[data-test-id="research-steps"], .research-steps').count()
         active_confirm = page.locator(
             '[data-test-id="confirm-button"]:not(.gem-button-disabled) button:not([disabled]), '
-            'button[aria-label="연구 시작"]:not([disabled])'
+            '[data-test-id="confirm-button"]:not(.gem-button-disabled), '
+            'button[aria-label="연구 시작"]:not([disabled]), '
+            'button[aria-label="Start research"]:not([disabled]), '
+            'button:has-text("연구 시작"):not([disabled]), '
+            'button:has-text("Start research"):not([disabled])'
         )
 
         if current_plan_count > prev_plan_count and active_confirm.count() > 0:
@@ -374,11 +608,12 @@ def wait_for_new_plan(page, prev_plan_count=0, timeout_sec=180):
         if elapsed - last_reload_at >= 60 and "/app/" in page.url:
             last_reload_at = elapsed
             log(f"Refreshing conversation state ({int(elapsed)}s elapsed)...")
-            page.reload(wait_until="domcontentloaded")
             try:
+                page.reload(wait_until="domcontentloaded")
+                prevent_background_throttling(page)
                 page.wait_for_selector("model-response", timeout=15000)
-            except Exception:
-                pass
+            except Exception as e:
+                log(f"Reload recovery notice: {e}")
             time.sleep(3.0)
             continue
 
@@ -393,11 +628,16 @@ def apply_plan_edit(page, edit_feedback, timeout_sec=180):
     prev_plan_count = page.locator('[data-test-id="research-steps"], .research-steps').count()
     prev_resp_count = page.locator("model-response").count()
 
-    edit_btn = page.locator(
-        '[data-test-id="edit-button"]:not(.gem-button-disabled) button:not([disabled]), '
-        '[data-test-id="edit-button"]:not(.gem-button-disabled), '
-        'button[aria-label="연구 계획 수정"]:not([disabled])'
-    ).last
+    edit_selectors = [
+        '[data-test-id="edit-button"]:not(.gem-button-disabled) button:not([disabled])',
+        '[data-test-id="edit-button"]:not(.gem-button-disabled)',
+        'button[aria-label="Edit plan"]:not([disabled])',
+        'button[aria-label="연구 계획 수정"]:not([disabled])',
+        '[data-test-id="edit-button"]',
+        'button:has-text("계획 수정"):not([disabled])',
+        'button:has-text("Edit plan"):not([disabled])',
+    ]
+    edit_btn = page.locator(", ".join(edit_selectors)).last
 
     if edit_btn.count() > 0:
         log("Clicking '계획 수정' (edit-button)...")
@@ -415,11 +655,15 @@ def apply_plan_edit(page, edit_feedback, timeout_sec=180):
 
 def confirm_current_plan(page):
     """Click '연구 시작' (confirm-button) on the latest Research Plan."""
-    confirm_btn = page.locator(
-        '[data-test-id="confirm-button"]:not(.gem-button-disabled) button:not([disabled]), '
-        '[data-test-id="confirm-button"]:not(.gem-button-disabled), '
-        'button[aria-label="연구 시작"]:not([disabled])'
-    ).last
+    confirm_selectors = [
+        '[data-test-id="confirm-button"]:not(.gem-button-disabled) button:not([disabled])',
+        '[data-test-id="confirm-button"]:not(.gem-button-disabled)',
+        'button[aria-label="연구 시작"]:not([disabled])',
+        'button[aria-label="Start research"]:not([disabled])',
+        'button:has-text("연구 시작"):not([disabled])',
+        'button:has-text("Start research"):not([disabled])',
+    ]
+    confirm_btn = page.locator(", ".join(confirm_selectors)).last
     if confirm_btn.count() == 0:
         raise RuntimeError("No active '연구 시작' (confirm-button) found on the current page.")
     log("Clicking '연구 시작' (Confirm Plan) to start Deep Research execution...")
@@ -612,10 +856,14 @@ def wait_for_report_completion(page, timeout_sec=1200):
         else:
             stable_ticks = 0
             last_len = state["reportTextLen"]
-            if time.time() - last_reload_time > 90:
+            if time.time() - last_reload_time > 60:
                 last_reload_time = time.time()
-                log("Refreshing conversation state from server...")
-                page.reload(wait_until="domcontentloaded")
+                log("Refreshing conversation state from server (60s background freeze recovery)...")
+                try:
+                    page.reload(wait_until="domcontentloaded")
+                    prevent_background_throttling(page)
+                except Exception as e:
+                    log(f"Reload recovery notice: {e}")
                 time.sleep(3.0)
 
         time.sleep(2.0)
@@ -648,6 +896,17 @@ def main():
         action="store_true",
         help="Use the exact prompt string provided at invocation time without any modification.",
     )
+    parser.add_argument(
+        "--compose-xml",
+        action="store_true",
+        help="Automatically wrap a plain topic/prompt into the 5-block XML Deep Research architecture (<research_objective>, <context_and_scope>, <investigation_axes>, <source_governance>, <output_format>).",
+    )
+    parser.add_argument("--context-scope", type=str, help="Custom <context_and_scope> content when --compose-xml is used.")
+    parser.add_argument("--axes", action="append", help="Investigation axis item(s) for <investigation_axes> (repeatable).")
+    parser.add_argument("--sources-policy", type=str, help="Custom <source_governance> rules when --compose-xml is used.")
+    parser.add_argument("--output-spec", type=str, help="Custom <output_format> rules when --compose-xml is used.")
+    parser.add_argument("--workspace-sources", type=str, help="Google Workspace (Drive/Gmail/Chat) entities to include in <context_and_scope>.")
+    parser.add_argument("--allow-questions", action="store_true", help="Bypass interrogative question check in --edit-prompt.")
     parser.add_argument("--output", type=str, help="Optional file path to save the resulting Markdown report.")
     parser.add_argument(
         "--review-plan",
@@ -700,11 +959,29 @@ def main():
 
     if args.step == "edit" and not args.edit_prompt:
         parser.error("--edit-prompt is required when --step edit is used.")
+    if args.step == "edit" and args.edit_prompt:
+        try:
+            args.edit_prompt = validate_edit_instructions(args.edit_prompt, allow_questions=bool(args.allow_questions))
+        except ValueError as e:
+            parser.error(str(e))
     if args.step in ("auto", "plan") and not args.prompt and not args.resume_url:
         parser.error("Either --prompt or --resume-url must be provided.")
+    if args.prompt and args.compose_xml and not args.raw_prompt and not has_full_xml_prompt_structure(args.prompt):
+        args.prompt = build_structured_xml_prompt(
+            objective=args.prompt,
+            context_scope=args.context_scope,
+            axes=args.axes,
+            sources_policy=args.sources_policy,
+            output_spec=args.output_spec,
+            workspace_sources=args.workspace_sources,
+        )
+        log("Composed 5-block XML Deep Research prompt.")
 
     app_info = ensure_gemini_running_with_cdp(port=CDP_PORT, hide=not args.show)
     log(f"Local Gemini app ready via CDP ({app_info['cdp_url']}, status={app_info['status']})")
+
+    if sync_playwright is None:
+        raise RuntimeError("Playwright is not installed. Run: pip install playwright")
 
     with sync_playwright() as p:
         browser = p.chromium.connect_over_cdp(app_info["cdp_url"])
@@ -726,13 +1003,22 @@ def main():
             print("=== [PLAN_REVIEW_HOOK_END] ===\n", flush=True)
             return
 
+        confirm_locators = (
+            '[data-test-id="confirm-button"]:not(.gem-button-disabled) button:not([disabled]), '
+            '[data-test-id="confirm-button"]:not(.gem-button-disabled), '
+            'button[aria-label="연구 시작"]:not([disabled]), '
+            'button[aria-label="Start research"]:not([disabled]), '
+            'button:has-text("연구 시작"):not([disabled]), '
+            'button:has-text("Start research"):not([disabled])'
+        )
+
         # Step mode 2: Approve the currently displayed plan and execute Deep Research
         if args.step == "approve":
-            confirm_btn = page.locator('[data-test-id="confirm-button"]:not(.gem-button-disabled) button:not([disabled])').last
+            confirm_btn = page.locator(confirm_locators).last
             if confirm_btn.count() > 0:
                 confirm_current_plan(page)
         elif args.resume_url:
-            confirm_btn = page.locator('[data-test-id="confirm-button"]:not(.gem-button-disabled) button:not([disabled])').last
+            confirm_btn = page.locator(confirm_locators).last
             if confirm_btn.count() > 0:
                 if args.review_plan or args.plan_hook:
                     plan_text = stop_auto_confirm_fuse_and_expand_plan(page)
